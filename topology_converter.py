@@ -11,12 +11,16 @@
 #
 version = "4.7.1"
 
+import pdb
 
 import os
 import re
 import sys
+import copy
 import time
+import yaml
 import pprint
+import random
 import jinja2
 import argparse
 import importlib
@@ -50,6 +54,10 @@ parser.add_argument('-p', '--provider', choices=["libvirt", "virtualbox"],
 parser.add_argument('-a', '--ansible-hostfile', action='store_true',
                     help='When specified, ansible hostfile will be generated \
                     from a dummy playbook run.')
+parser.add_argument('--ansible-group-vars-only', action='store_true',
+                    help='Generate ansible group_vars/all structure for the topology \
+                    which can be used by playbook. Template is defined in \
+                    "group_vars_config" file')
 parser.add_argument('-c', '--create-mgmt-network', action='store_true',
                     help='When specified, a mgmt switch and server will be created. \
                     A /24 is assumed for the mgmt network. mgmt_ip=X.X.X.X will be \
@@ -131,7 +139,7 @@ VAGRANTFILE_template = template_storage + "/Vagrantfile.j2"
 TEMPLATES = [[VAGRANTFILE_template, VAGRANTFILE]]
 
 # Parse Arguments
-network_functions = ['oob-switch', 'internet', 'exit', 'superspine', 'spine', 'leaf', 'tor']
+network_functions = ['oob-switch', 'internet', 'exit', 'edge', 'superspine', 'spine', 'leaf', 'tor']
 function_group = {}
 provider = "virtualbox"
 generate_ansible_hostfile = False
@@ -156,6 +164,8 @@ if args.verbose: verbose = args.verbose
 if args.provider: provider = args.provider
 
 if args.ansible_hostfile: generate_ansible_hostfile = True
+
+ansible_group_vars_only = True if args.ansible_group_vars_only else False
 
 if args.create_mgmt_device: create_mgmt_device = True
 
@@ -280,6 +290,16 @@ def get_random_localhost_ip():
     bits = random.getrandbits(subnet.max_prefixlen - subnet.prefixlen)
     addr = ipaddress.IPv4Address(subnet.network_address + bits)
     return str(addr)
+
+
+# Workaround for the issue with doing +1 on an IPvXInterface object
+# which resets the prefixlen to /32. This allows doing something like
+# IPvXInterface('192.168.1.1/24') + 1 and receiving 192.168.1.2/24
+# Note that this func does not check if (de)increment returns the
+# value which is out of the defined subnet range
+def get_next_interface_ip(interface):
+    return ipaddress.ip_interface(str(interface.ip+1) +
+            '/'+str(interface.network.prefixlen))
 
 
 def lint_topo_file(topology_file):
@@ -1415,6 +1435,204 @@ callback_whitelist = profile_tasks
 jinja2_extensions=jinja2.ext.do""")
 
 
+def get_mlag_peer_hostname(device, device_type_cfg):
+    mlag_peer_hostname = None
+
+    mlag_peerlink_interface = device_type_cfg['mlag']['members'][0]
+    for interface in device['interfaces']:
+        if interface['local_interface'] == mlag_peerlink_interface:
+            mlag_peer_hostname = interface['remote_device']
+
+    return mlag_peer_hostname
+
+
+def get_device_by_hostname(devices, hostname):
+    return next(dev for dev in devices if dev['hostname'] == hostname)
+
+group_vars_state = {
+    'irb': {}
+}
+def get_next_asn_for_bgp_layer(device_type, bgp_layer, val_if_no_prev_val):
+    global group_vars_state
+
+    prev_asn_key = 'prev_'+bgp_layer+'_asn'
+    try:
+        asn = int(group_vars_state[device_type][prev_asn_key])
+        asn = asn + 1
+    except KeyError:
+        asn = val_if_no_prev_val
+
+    group_vars_state[device_type][prev_asn_key] = asn
+    return asn
+
+
+def generate_ansible_group_vars_all(devices):
+    global group_vars_state
+    group_vars_all = dict(
+        node = dict()
+    )
+    function_group_node = next(yaml.load_all(open('./group_vars_config', 'r')))['node']
+
+    # Start with device type in the group_vars template (first leafs, then spines etc.)
+    for device_type, device_type_cfg in function_group_node.items():
+        group_vars_state[device_type] = dict()
+
+        # WARN user if topology.dot does not have template is defined, but topology.dot 
+        if device_type not in function_group:
+            print(styles.WARNING + "You have a template defined for '"+device_type+"', but no hosts with the same type (function='"+device_type+"') in topology.dot. Skipping this template." + styles.ENDC)
+            continue
+#            print(styles.FAIL + "ERROR: I do not know how to handle function='"+device_type+"' found in group_vars/all template. Please remove this section from the template or contact the developer." + styles.ENDC)
+#            exit(1)
+
+        # Iterate though the devices from topology.dot and choose the currently
+        # active type (for example, leaf)
+        for hostname in function_group[device_type]:
+            if hostname == 'netq-ts': continue
+
+            has_mlag = ('mlag' in device_type_cfg)
+            device = get_device_by_hostname(devices, hostname)
+            
+            # Get our MLAG peer's config if we are using MLAG
+            if has_mlag:
+                # Determine MLAG peer hostname
+                mlag_peer_hostname = get_mlag_peer_hostname(device, device_type_cfg)
+                if mlag_peer_hostname is None:
+                    print(styles.WARNING + "WARNING: Unable to determine MLAG peer for "+hostname+". Most likely MLAG peerlink interfaces were not defined in topology.dot. Treating this host as non-MLAG." + styles.ENDC)
+                    has_mlag = False
+                else:
+                    peer_device = get_device_by_hostname(devices, mlag_peer_hostname)
+                    if verbose > 2:
+                        print("Hostname: " + hostname + ". Peer hostname is: "+mlag_peer_hostname)
+
+                # Try to get MLAG peer's group_vars/all config if that has been already
+                # defined
+                peer_vars = None
+                try:
+                    peer_vars = group_vars_all['node'][mlag_peer_hostname]
+                except KeyError:
+                    peer_vars = None
+            # [-] get MLAG peer's config
+
+            # Copy the whole structure from the template and then
+            # overwrite the values we know how to treat
+            group_vars_all_node = copy.deepcopy(device_type_cfg)
+            for cfg_template_name, cfg_template in group_vars_all_node.items():
+                if cfg_template_name == 'routing':
+                    for routing_item_name, routing_item in cfg_template.items():
+                        if routing_item_name == 'lo':
+                            # Loopback IP
+                            # See, if we have given out an IP for this device_type, if yes
+                            # then generate the next one
+                            try:
+                                lo_ip = group_vars_state[device_type]['prev_lo']
+                                lo_ip = lo_ip + 1
+                            except KeyError:
+                                lo_ip = ipaddress.IPv4Interface(cfg_template['lo'])
+
+                            group_vars_all_node['routing']['lo'] = str(lo_ip)
+                            group_vars_state[device_type]['prev_lo'] = lo_ip
+                            # [-] Loopback IP
+
+                        # node.*.routing.bgp.underlay
+                        # node.*.routing.bgp.external
+                        elif routing_item_name == 'bgp':
+                            for bgp_item_type, bgp_item in routing_item.items():
+                                if bgp_item_type == 'underlay': # Underlay (internal) BGP ASN
+                                    bgp_item['asn'] = get_next_asn_for_bgp_layer(device_type, bgp_item_type, bgp_item['asn'])
+                                elif bgp_item_type == 'external':
+                                    external_asn = None
+                                    for tenant_name, tenant_item in bgp_item.items():
+                                        # External (border) BGP ASN
+                                        if external_asn is None:
+                                            external_asn = get_next_asn_for_bgp_layer(device_type, bgp_item_type, tenant_item['asn'])
+                                        tenant_item['asn'] = external_asn
+                                else:
+                                    print((styles.FAIL + 'I do not know how to handle node.%s.%s.%s.%s. Please remove this section from the template or contact the developer.' + styles.ENDC) % (device_type, cfg_template_name, routing_item_name, bgp_item_type)) 
+                                    exit(1)
+                # [-] node.*.routing
+                # [+] node.*.mlag
+                elif cfg_template_name == 'mlag':
+                    if peer_vars:
+                        # take sysmac from the MLAG peer
+                        group_vars_all_node[cfg_template_name]['sysmac'] = peer_vars['mlag']['sysmac']
+                        # set out peer-ip to the MLAG peer's MLAG address
+                        group_vars_all_node[cfg_template_name]['peer-ip'] = str(ipaddress.IPv4Interface(peer_vars['mlag']['address']).ip)
+                        # figure out our MLAG address from the peer's (WARNING: this assumes that the peer with .1 comes first!)
+                        group_vars_all_node[cfg_template_name]['address'] = str(get_next_interface_ip(ipaddress.IPv4Interface(peer_vars['mlag']['address'])))
+                        # set our MLAG backup-IP to the peer's loopback
+                        group_vars_all_node[cfg_template_name]['backup-ip'] = str(ipaddress.IPv4Interface(peer_vars['routing']['lo']).ip)
+                        # set the peer's backup-ip to our loopback (peer could not have done it when it was being configured, because this leaf didn't exist)
+                        peer_vars['mlag']['backup-ip'] = str(ipaddress.IPv4Interface(group_vars_all_node['routing']['lo']).ip)
+                    # No MLAG peer config means we're the first peer in the pair
+                    else:
+                        try:
+                            sysmac = group_vars_state[device_type]['prev_mlag_sysmac']
+                            sysmac = ("%x" % (int(sysmac, 16) + 1)).lower()
+                        except KeyError:
+                            sysmac = re.sub(':', '', cfg_template['sysmac'])
+
+                        group_vars_all_node[cfg_template_name]['sysmac'] = add_mac_colon(sysmac)
+                        group_vars_state[device_type]['prev_mlag_sysmac'] = sysmac
+                        group_vars_all_node[cfg_template_name]['peer-ip'] = str(ipaddress.IPv4Interface(group_vars_all_node[cfg_template_name]['address']).ip+1)
+                    # [-] sysmac handling
+                elif cfg_template_name == 'overlay':
+                    if has_mlag:
+                       # VTEP Pair Anycast IP
+                       # If we have a peer take its anycast IP for ours
+                        if peer_vars:
+                            anycast_ip = ipaddress.IPv4Interface(peer_vars[cfg_template_name]['anycast-ip'])
+                        # No MLAG peer config means we're the first peer in the pair, so
+                        # take next available IP
+                        else:
+                            try:
+                               anycast_ip = get_next_interface_ip(group_vars_state[device_type]['prev_vtep_anycast_ip'])
+                            except KeyError:
+                               anycast_ip = ipaddress.IPv4Interface(cfg_template['anycast-ip'])
+
+                        group_vars_all_node[cfg_template_name]['anycast-ip'] = str(anycast_ip)
+                        group_vars_state[device_type]['prev_vtep_anycast_ip'] = anycast_ip
+                        # [-] VTEP Pair Anycast IP
+
+                    for irb_id, irb in cfg_template['irb'].items():
+                        for af in ('ipv4', 'ipv6'):
+                            # Some IRBs might not have IP addresses
+                            if af not in irb.keys():
+                                continue
+
+                            prev_state_key = str("%s_%s_%s_prev" % ('irb', irb_id, af))
+                            # Note: no need to change the VRRP IP as it should be the same at all nodes
+                            try:
+                                af_prefix = get_next_interface_ip(group_vars_state['irb'][prev_state_key])
+                            except KeyError:
+                                af_prefix = ipaddress.ip_interface(irb[af]['None'])
+
+                            irb[af]['None'] = str(af_prefix)
+                            group_vars_state['irb'][prev_state_key] = af_prefix
+                # [-] overlay handling
+                elif cfg_template_name == 'id':
+                    # Host ID
+                    # See, if we have given out an ID for this device_type, if yes
+                    # then generate the next one
+                    try:
+                        host_id = group_vars_state[device_type]['prev_id']
+                        host_id = host_id + 1
+                    except KeyError:
+                        host_id = cfg_template
+
+                    group_vars_all_node['id'] = host_id
+                    group_vars_state[device_type]['prev_id'] = host_id
+                # [-] Host ID handling
+
+
+            # Save the generated config for the host  
+            group_vars_all['node'][hostname] = group_vars_all_node
+
+    yaml.dump(group_vars_all, open("./group_vars_all", 'w'), default_flow_style=False)
+#   pp.pprint(group_vars_all)
+#   pp.pprint(group_vars_state)
+
+
+
 def main():
     global mac_map
     print(styles.HEADER + "\n######################################")
@@ -1427,6 +1645,10 @@ def main():
     devices = populate_data_structures(inventory)
 
     remove_generated_files()
+
+    generate_ansible_group_vars_all(devices)
+    if ansible_group_vars_only:
+        exit(0)
 
     render_jinja_templates(devices)
 
